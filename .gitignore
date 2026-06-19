@@ -1,0 +1,24 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables & secrets
+.env
+.env.*
+
+# Logs
+*.log
+
+# macOS system files
+.DS_Store
+__MACOSX/
+
+# Generated outputs
+output.csv
