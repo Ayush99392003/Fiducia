@@ -34,6 +34,7 @@ CLAIMS_CSV = REPO_ROOT / "dataset" / "claims.csv"
 USER_HISTORY = REPO_ROOT / "dataset" / "user_history.csv"
 EVIDENCE_REQS = REPO_ROOT / "dataset" / "evidence_requirements.csv"
 OUTPUT_CSV = REPO_ROOT / "output.csv"
+DETAILS_CSV = REPO_ROOT / "output_details.csv"
 
 # Required output column order per problem_statement.md
 OUTPUT_COLUMNS = [
@@ -72,17 +73,17 @@ from code.evaluation.main import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def run(use_cot: bool = True) -> None:
+def run(strategy_mode: str = "Smart") -> None:
     """Run predictions on the blind test set and write output.csv.
 
     Args:
-        use_cot: If True, uses Strategy B (CoT). Otherwise Strategy A.
+        strategy_mode: "Smart" (dynamic), "A" (Direct), or "B" (CoT).
     """
     from code.llm import evaluate_claim
     from code.tracing import init_tracer
 
-    strategy_label = "B_CoT" if use_cot else "A_Direct"
-    session_id = f"predict-{strategy_label}-{uuid.uuid4().hex[:8]}"
+    strategy_label = f"Strategy_{strategy_mode}"
+    session_id = f"predict-{strategy_mode}-{uuid.uuid4().hex[:8]}"
     init_tracer(session_id=session_id)
 
     console.print(
@@ -97,6 +98,7 @@ def run(use_cot: bool = True) -> None:
     evidence_df = pd.read_csv(EVIDENCE_REQS)
 
     output_rows: list[dict] = []
+    details_rows: list[dict] = []
     errors = 0
 
     with Progress(
@@ -131,6 +133,16 @@ def run(use_cot: bool = True) -> None:
             )
             history_flags = str(history_row.get("history_flags", "none"))
 
+            recent_claims = int(history_row.get("last_90_days_claim_count", 0))
+
+            if strategy_mode == "Smart":
+                if recent_claims > 0 or history_flags != "none":
+                    use_cot = True
+                else:
+                    use_cot = False
+            else:
+                use_cot = (strategy_mode == "B")
+
             evidence_req = _get_evidence_requirement(
                 claim_object, evidence_df
             )
@@ -139,7 +151,6 @@ def run(use_cot: bool = True) -> None:
                 raw_prediction = evaluate_claim(
                     claim_object=claim_object,
                     user_claim=user_claim,
-                    history_summary=history_summary,
                     evidence_requirement=evidence_req,
                     image_paths=image_paths,
                     image_ids=image_ids,
@@ -149,11 +160,14 @@ def run(use_cot: bool = True) -> None:
                 )
             except Exception as exc:
                 console.print(
-                    f"[red]ERROR {user_id}: {exc}[/red]"
+                    f"    [yellow]⚠️ Azure API rejected image for {user_id} (Invalid Format). Falling back to 'not_enough_information'[/yellow]"
                 )
                 errors += 1
-                progress.advance(task)
-                continue
+                raw_prediction = {
+                    "valid_image": False,
+                    "claim_status": "not_enough_information",
+                    "claim_status_justification": "Automated evaluation failed due to invalid image format or API error.",
+                }
 
             prediction = _post_process(raw_prediction.copy(), history_flags)
 
@@ -186,16 +200,28 @@ def run(use_cot: bool = True) -> None:
                 "severity": prediction.get("severity", "unknown"),
             })
 
+            details_rows.append({
+                "user_id": user_id,
+                "strategy_used": "Strategy B (CoT)" if use_cot else "Strategy A (Direct)",
+                "input_tokens": raw_prediction.get("input_tokens", 0),
+                "output_tokens": raw_prediction.get("output_tokens", 0),
+                "latency_seconds": raw_prediction.get("latency_seconds", 0.0),
+                **output_rows[-1]  # Include all original outputs as well
+            })
+
             progress.advance(task)
 
     output_df = pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
     output_df.to_csv(OUTPUT_CSV, index=False)
 
+    details_df = pd.DataFrame(details_rows)
+    details_df.to_csv(DETAILS_CSV, index=False)
+
     console.print(
         Panel.fit(
             f"[bold green]Done![/bold green] "
-            f"Wrote [cyan]{len(output_df)}[/cyan] rows to "
-            f"[cyan]{OUTPUT_CSV}[/cyan]. "
+            f"Wrote [cyan]{len(output_df)}[/cyan] rows to [cyan]{OUTPUT_CSV}[/cyan]\n"
+            f"Wrote token details to [cyan]{DETAILS_CSV}[/cyan].\n"
             f"Errors: [red]{errors}[/red]"
         )
     )
@@ -206,9 +232,16 @@ if __name__ == "__main__":
         description="Generate output.csv for claims.csv."
     )
     parser.add_argument(
-        "--direct",
-        action="store_true",
-        help="Use Strategy A (Direct) instead of Strategy B (CoT).",
+        "--strategy",
+        type=str,
+        default="Smart",
+        choices=["Smart", "A", "B"],
+        help="Strategy to use (Smart, A, B). Default is Smart.",
     )
     args = parser.parse_args()
-    run(use_cot=not args.direct)
+    
+    # Backwards compatibility for --direct
+    if hasattr(args, "direct") and args.direct:
+        args.strategy = "A"
+        
+    run(strategy_mode=args.strategy)

@@ -10,6 +10,8 @@ Usage:
 
 import sys
 import uuid
+import json
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -180,11 +182,12 @@ def _get_evidence_requirement(
 # ---------------------------------------------------------------------------
 
 
-def run_evaluation(use_cot: bool) -> dict:
+def run_evaluation(strategy_mode: str, limit: int | None = None) -> dict:
     """Run the full evaluation loop for one strategy.
 
     Args:
-        use_cot: True for Strategy B (CoT), False for Strategy A (Direct).
+        strategy_mode: 'A' (Direct), 'B' (CoT), or 'Smart' (Dynamic Routing).
+        limit: Optional maximum number of cases to evaluate.
 
     Returns:
         Dict with per-case results and aggregate metrics.
@@ -192,11 +195,14 @@ def run_evaluation(use_cot: bool) -> dict:
     from code.llm import evaluate_claim
     from code.tracing import init_tracer
 
-    strategy_label = "B_CoT" if use_cot else "A_Direct"
+    strategy_label = f"Strategy_{strategy_mode}"
     session_id = f"eval-{strategy_label}-{uuid.uuid4().hex[:8]}"
     init_tracer(session_id=session_id)
 
     claims_df = pd.read_csv(SAMPLE_CLAIMS)
+    if limit is not None:
+        claims_df = claims_df.head(limit)
+        
     history_df = pd.read_csv(USER_HISTORY).set_index("user_id")
     evidence_df = pd.read_csv(EVIDENCE_REQS)
 
@@ -225,17 +231,25 @@ def run_evaluation(use_cot: bool) -> dict:
 
         # User history context
         history_row = history_df.loc[user_id] if user_id in history_df.index else {}
-        history_summary = str(
-            history_row.get("history_summary", "No prior history.")
-        )
         history_flags = str(history_row.get("history_flags", "none"))
+        recent_claims = int(history_row.get("last_90_days_claim_count", 0))
+
+        # Dynamic routing logic for Smart mode
+        if strategy_mode == "Smart":
+            # If they have recent claims or existing risk flags, use careful CoT
+            if recent_claims > 0 or history_flags != "none":
+                use_cot = True
+            else:
+                use_cot = False
+        else:
+            use_cot = (strategy_mode == "B")
 
         # Evidence requirement
         evidence_req = _get_evidence_requirement(claim_object, evidence_df)
 
         console.print(
             f"  [{idx + 1}/{len(claims_df)}] {user_id} | "
-            f"{claim_object} | {len(image_paths)} image(s) ...",
+            f"{claim_object} | {len(image_paths)} image(s) [dim]({ 'CoT' if use_cot else 'Direct' })[/dim]...",
             style="dim",
         )
 
@@ -243,7 +257,6 @@ def run_evaluation(use_cot: bool) -> dict:
             raw_prediction = evaluate_claim(
                 claim_object=claim_object,
                 user_claim=user_claim,
-                history_summary=history_summary,
                 evidence_requirement=evidence_req,
                 image_paths=image_paths,
                 image_ids=image_ids,
@@ -343,24 +356,38 @@ def print_comparison(
     acc_table.add_column("Metric", style="bold")
     acc_table.add_column("Strategy A (Direct)", justify="center")
     acc_table.add_column("Strategy B (CoT)", justify="center")
+    if "metrics_smart" in globals():
+        acc_table.add_column("Strategy Smart", justify="center")
 
-    acc_table.add_row(
+    def get_row(label, metrics_a, metrics_b, metrics_smart=None, fmt="{}"):
+        row = [label, fmt.format(metrics_a), fmt.format(metrics_b)]
+        if metrics_smart is not None:
+            row.append(fmt.format(metrics_smart))
+        return row
+
+    acc_table.add_row(*get_row(
         "Perfect Match %",
-        f"{metrics_a['perfect_match_pct']:.1f}%",
-        f"{metrics_b['perfect_match_pct']:.1f}%",
-    )
-    acc_table.add_row(
+        metrics_a['perfect_match_pct'],
+        metrics_b['perfect_match_pct'],
+        globals().get('metrics_smart', {}).get('perfect_match_pct'),
+        "{:.1f}%"
+    ))
+    acc_table.add_row(*get_row(
         "Avg Partial Score %",
-        f"{metrics_a['avg_partial_score']:.1f}%",
-        f"{metrics_b['avg_partial_score']:.1f}%",
-    )
+        metrics_a['avg_partial_score'],
+        metrics_b['avg_partial_score'],
+        globals().get('metrics_smart', {}).get('avg_partial_score'),
+        "{:.1f}%"
+    ))
 
     for field in EXACT_FIELDS + SET_FIELDS:
-        acc_table.add_row(
+        acc_table.add_row(*get_row(
             f"  {field}",
-            f"{metrics_a['field_accuracy'][field]:.1f}%",
-            f"{metrics_b['field_accuracy'][field]:.1f}%",
-        )
+            metrics_a['field_accuracy'][field],
+            metrics_b['field_accuracy'][field],
+            globals().get('metrics_smart', {}).get('field_accuracy', {}).get(field),
+            "{:.1f}%"
+        ))
     console.print(acc_table)
 
     # Operational table
@@ -373,6 +400,8 @@ def print_comparison(
     ops_table.add_column("Metric", style="bold")
     ops_table.add_column("Strategy A (Direct)", justify="center")
     ops_table.add_column("Strategy B (CoT)", justify="center")
+    if "metrics_smart" in globals():
+        ops_table.add_column("Strategy Smart", justify="center")
 
     for label, key, fmt in [
         ("Cases Evaluated", "n", "{}"),
@@ -384,41 +413,63 @@ def print_comparison(
         ("Avg Latency / case", "avg_latency", "{:.2f}s"),
         ("Estimated Cost (USD)", "estimated_cost_usd", "${:.4f}"),
     ]:
-        ops_table.add_row(
+        ops_table.add_row(*get_row(
             label,
-            fmt.format(metrics_a[key]),
-            fmt.format(metrics_b[key]),
-        )
+            metrics_a[key],
+            metrics_b[key],
+            globals().get('metrics_smart', {}).get(key),
+            fmt
+        ))
     console.print(ops_table)
     console.print()
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None, help="Number of claims to evaluate")
+    parser.add_argument("--save", type=str, default="evaluation_results.json", help="Path to save results")
+    args = parser.parse_args()
+
     console.print(
         Panel.fit(
             "[bold green]Running Strategy A (Direct) ...[/bold green]"
         )
     )
-    metrics_a = run_evaluation(use_cot=False)
+    metrics_a = run_evaluation(strategy_mode="A", limit=args.limit)
 
     console.print(
         Panel.fit(
             "[bold green]Running Strategy B (Chain-of-Thought) ...[/bold green]"
         )
     )
-    metrics_b = run_evaluation(use_cot=True)
+    metrics_b = run_evaluation(strategy_mode="B", limit=args.limit)
+
+    console.print(
+        Panel.fit(
+            "[bold green]Running Strategy Smart (Dynamic Routing) ...[/bold green]"
+        )
+    )
+    global metrics_smart
+    metrics_smart = run_evaluation(strategy_mode="Smart", limit=args.limit)
 
     print_comparison(metrics_a, metrics_b)
 
-    # Recommend the winner
-    winner = (
-        "B (CoT)"
-        if metrics_b["perfect_match_pct"] >= metrics_a["perfect_match_pct"]
-        else "A (Direct)"
-    )
+    # Recommend the winner (now comparing all 3)
+    best_score = max(metrics_a["perfect_match_pct"], metrics_b["perfect_match_pct"], metrics_smart["perfect_match_pct"])
+    if metrics_smart["perfect_match_pct"] >= best_score and metrics_smart["estimated_cost_usd"] <= metrics_b["estimated_cost_usd"]:
+        winner = "Smart (Dynamic Routing)"
+    elif metrics_b["perfect_match_pct"] >= metrics_a["perfect_match_pct"]:
+        winner = "B (CoT)"
+    else:
+        winner = "A (Direct)"
     console.print(
         Panel.fit(
             f"[bold yellow]Recommended strategy for output.csv: "
             f"Strategy {winner}[/bold yellow]"
         )
     )
+
+    # Save results
+    with open(args.save, "w") as f:
+        json.dump({"Strategy_A": metrics_a, "Strategy_B": metrics_b, "Strategy_Smart": metrics_smart}, f, indent=2)
+    console.print(f"[bold green]Results successfully saved to {args.save}[/bold green]")

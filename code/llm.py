@@ -5,6 +5,7 @@ All Azure OpenAI calls are centralised here. Callers should use
 """
 
 import base64
+import io
 import os
 import time
 from pathlib import Path
@@ -13,10 +14,15 @@ from typing import Union
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 from opentelemetry import trace
+from PIL import Image
+import pillow_heif
+
+# Register HEIF opener so PIL can natively read HEIC images disguised as .jpg
+pillow_heif.register_heif_opener()
 
 from .schema import (
-    DamageClaimEvaluation,
-    DirectDamageClaimEvaluation,
+    get_direct_schema,
+    get_cot_schema,
 )
 from .prompts import (
     DIRECT_SYSTEM_PROMPT,
@@ -69,8 +75,15 @@ def encode_image_b64(image_path: str | Path) -> str:
         raise FileNotFoundError(
             f"Image not found: {path.resolve()}"
         )
-    with open(path, "rb") as fh:
-        return base64.b64encode(fh.read()).decode("utf-8")
+    
+    # Use PIL to read the image (automatically handling HEIC/WEBP/PNG)
+    # and re-encode it strictly as JPEG into a memory buffer.
+    with Image.open(path) as img:
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def _build_image_content_blocks(
@@ -96,7 +109,7 @@ def _build_image_content_blocks(
             {
                 "type": "input_image",
                 "image_url": f"data:image/jpeg;base64,{b64}",
-                "detail": "high",
+                "detail": "auto",
             }
         )
     return blocks
@@ -111,7 +124,6 @@ def evaluate_claim(
     *,
     claim_object: str,
     user_claim: str,
-    history_summary: str,
     evidence_requirement: str,
     image_paths: list[str],
     image_ids: list[str],
@@ -124,7 +136,6 @@ def evaluate_claim(
     Args:
         claim_object: 'car', 'laptop', or 'package'.
         user_claim: Customer chat transcript.
-        history_summary: Human-readable user history risk summary.
         evidence_requirement: Minimum evidence requirement text.
         image_paths: Image paths relative to repo root.
         image_ids: Ordered image IDs matching image_paths.
@@ -139,9 +150,9 @@ def evaluate_claim(
     strategy = "B_CoT" if use_cot else "A_Direct"
     system_prompt = COT_SYSTEM_PROMPT if use_cot else DIRECT_SYSTEM_PROMPT
     schema = (
-        DamageClaimEvaluation
+        get_cot_schema(claim_object)
         if use_cot
-        else DirectDamageClaimEvaluation
+        else get_direct_schema(claim_object)
     )
     build_user_msg = (
         build_cot_user_message if use_cot else build_direct_user_message
@@ -150,7 +161,6 @@ def evaluate_claim(
     user_text = build_user_msg(
         claim_object=claim_object,
         user_claim=user_claim,
-        history_summary=history_summary,
         evidence_requirement=evidence_requirement,
         image_ids=image_ids,
     )
@@ -193,9 +203,7 @@ def evaluate_claim(
         input_tokens: int = getattr(usage, "input_tokens", 0)
         output_tokens: int = getattr(usage, "output_tokens", 0)
 
-        result_obj: Union[
-            DamageClaimEvaluation, DirectDamageClaimEvaluation
-        ] = response.output_parsed
+        result_obj = response.output_parsed
 
         span.set_attribute(
             "llm.output_messages", str(result_obj)[:2000]

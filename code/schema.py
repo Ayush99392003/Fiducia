@@ -5,9 +5,9 @@ Strategy B — DamageClaimEvaluation (CoT): scratchpad forced as first field
     so the model reasons step-by-step before committing to categorical values.
 """
 
-from typing import Literal
+from typing import Literal, Type
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 # ---------------------------------------------------------------------------
 # Shared type aliases
@@ -30,8 +30,7 @@ IssueType = Literal[
     "unknown",
 ]
 
-ObjectPart = Literal[
-    # Car
+CarPart = Literal[
     "front_bumper",
     "rear_bumper",
     "door",
@@ -42,7 +41,11 @@ ObjectPart = Literal[
     "taillight",
     "fender",
     "quarter_panel",
-    # Laptop
+    "body",
+    "unknown",
+]
+
+LaptopPart = Literal[
     "screen",
     "keyboard",
     "trackpad",
@@ -51,7 +54,11 @@ ObjectPart = Literal[
     "corner",
     "port",
     "base",
-    # Package
+    "body",
+    "unknown",
+]
+
+PackagePart = Literal[
     "box",
     "package_corner",
     "package_side",
@@ -59,10 +66,15 @@ ObjectPart = Literal[
     "label",
     "contents",
     "item",
-    # Shared / fallback
     "body",
     "unknown",
 ]
+
+ObjectPartMap = {
+    "car": CarPart,
+    "laptop": LaptopPart,
+    "package": PackagePart,
+}
 
 RiskFlag = Literal[
     "none",
@@ -110,9 +122,11 @@ _RISK_FLAGS = Field(
     )
 )
 _ISSUE_TYPE = Field(description="The visible issue type found in the image.")
-_OBJECT_PART = Field(
-    description="The specific part of the object being evaluated."
-)
+
+def _get_object_part_field(claim_object: str):
+    """Return a typed field for object_part based on the claim_object."""
+    part_type = ObjectPartMap.get(claim_object.lower(), Literal["unknown"])
+    return (part_type, Field(description="The specific part of the object being evaluated."))
 _CLAIM_STATUS = Field(
     description=(
         "Final decision on whether the image evidence supports the "
@@ -128,10 +142,21 @@ _CLAIM_STATUS_JUSTIFICATION = Field(
 _SUPPORTING_IMAGE_IDS = Field(
     description=(
         "Image IDs supporting the decision, separated by semicolons. "
+        "GUARDRAIL: If claim is SUPPORTED, list ONLY the image(s) where the damage is clearly visible. Do NOT include context-only wide shots. "
+        "If CONTRADICTED (e.g., intact package), list all images that prove it is intact. "
         "Use 'none' if no image is sufficient."
     )
 )
-_SEVERITY = Field(description="The estimated severity of the visible damage.")
+_SEVERITY = Field(
+    description=(
+        "The estimated severity of the visible damage. STRICT GUIDELINES (BE EXTREMELY CONSERVATIVE - NEVER OVER-PREDICT):\n"
+        "- none: No physical damage is visible in the image.\n"
+        "- low: Minor cosmetic damage (e.g., surface scratches, small corner dents, minor box creases).\n"
+        "- medium: Clearly visible damage affecting integrity but not catastrophic (e.g., standard dents, cracked glass, broken hinges, liquid stains, crushed packaging).\n"
+        "- high: Severe, catastrophic structural damage or complete detachment.\n"
+        "- unknown: Image does not show the required part or lacks information."
+    )
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,23 +164,23 @@ _SEVERITY = Field(description="The estimated severity of the visible damage.")
 # ---------------------------------------------------------------------------
 
 
-class DirectDamageClaimEvaluation(BaseModel):
-    """Structured output for Strategy A (Direct / Normal mode).
-
-    The model immediately evaluates and outputs the classification
-    without an intermediate reasoning scratchpad.
-    """
-
-    evidence_standard_met: bool = _EVIDENCE_MET
-    evidence_standard_met_reason: str = _EVIDENCE_MET_REASON
-    valid_image: bool = _VALID_IMAGE
-    risk_flags: RiskFlag = _RISK_FLAGS
-    issue_type: IssueType = _ISSUE_TYPE
-    object_part: ObjectPart = _OBJECT_PART
-    claim_status: ClaimStatus = _CLAIM_STATUS
-    claim_status_justification: str = _CLAIM_STATUS_JUSTIFICATION
-    supporting_image_ids: str = _SUPPORTING_IMAGE_IDS
-    severity: Severity = _SEVERITY
+def get_direct_schema(claim_object: str) -> Type[BaseModel]:
+    """Dynamically generate the Strategy A schema locked to a specific claim object."""
+    part_type, part_field = _get_object_part_field(claim_object)
+    
+    return create_model(
+        "DirectDamageClaimEvaluation",
+        evidence_standard_met=(bool, _EVIDENCE_MET),
+        evidence_standard_met_reason=(str, _EVIDENCE_MET_REASON),
+        valid_image=(bool, _VALID_IMAGE),
+        risk_flags=(RiskFlag, _RISK_FLAGS),
+        issue_type=(IssueType, _ISSUE_TYPE),
+        object_part=(part_type, part_field),
+        claim_status=(ClaimStatus, _CLAIM_STATUS),
+        claim_status_justification=(str, _CLAIM_STATUS_JUSTIFICATION),
+        supporting_image_ids=(str, _SUPPORTING_IMAGE_IDS),
+        severity=(Severity, _SEVERITY),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -163,33 +188,32 @@ class DirectDamageClaimEvaluation(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class DamageClaimEvaluation(BaseModel):
-    """Structured output for Strategy B (Chain-of-Thought mode).
-
-    The reasoning_scratchpad is the first field so the model is forced
-    to reason step-by-step before committing to categorical values.
-    """
-
-    # Must be first — forces the model to reason before deciding.
-    reasoning_scratchpad: str = Field(
+def get_cot_schema(claim_object: str) -> Type[BaseModel]:
+    """Dynamically generate the Strategy B schema locked to a specific claim object."""
+    part_type, part_field = _get_object_part_field(claim_object)
+    
+    _REASONING = Field(
         description=(
             "Step-by-step reasoning block (not included in output.csv). "
             "1. Describe exactly what is visible in each image. "
             "2. Extract the user's claim from the chat transcript. "
             "3. Cross-reference the minimum evidence requirement for "
             "this claim_object and damage type. "
-            "4. Note any user history risk signals. "
-            "5. Determine the claim_status and all output fields."
+            "4. Determine the claim_status and all output fields."
         )
     )
 
-    evidence_standard_met: bool = _EVIDENCE_MET
-    evidence_standard_met_reason: str = _EVIDENCE_MET_REASON
-    valid_image: bool = _VALID_IMAGE
-    risk_flags: RiskFlag = _RISK_FLAGS
-    issue_type: IssueType = _ISSUE_TYPE
-    object_part: ObjectPart = _OBJECT_PART
-    claim_status: ClaimStatus = _CLAIM_STATUS
-    claim_status_justification: str = _CLAIM_STATUS_JUSTIFICATION
-    supporting_image_ids: str = _SUPPORTING_IMAGE_IDS
-    severity: Severity = _SEVERITY
+    return create_model(
+        "DamageClaimEvaluation",
+        reasoning_scratchpad=(str, _REASONING),
+        evidence_standard_met=(bool, _EVIDENCE_MET),
+        evidence_standard_met_reason=(str, _EVIDENCE_MET_REASON),
+        valid_image=(bool, _VALID_IMAGE),
+        risk_flags=(RiskFlag, _RISK_FLAGS),
+        issue_type=(IssueType, _ISSUE_TYPE),
+        object_part=(part_type, part_field),
+        claim_status=(ClaimStatus, _CLAIM_STATUS),
+        claim_status_justification=(str, _CLAIM_STATUS_JUSTIFICATION),
+        supporting_image_ids=(str, _SUPPORTING_IMAGE_IDS),
+        severity=(Severity, _SEVERITY),
+    )
